@@ -9,4 +9,4 @@ Sketch 1 is the Gemini brain.
 Sketch 2 is the face tracking.
 Sketch 3 is the lcd sine-wave.
 
-I will add these as I can.
+I will add these as I can. Just remember: insert your api key and hardware id's
