@@ -1,80 +1,50 @@
-import os
 import numpy as np
-import sounddevice as sd
-import matplotlib.pyplot as plt
-import matplotlib.animation as animation
-from scipy.signal import butter, lfilter
-import matplotlib
-matplotlib.use('TkAgg')  # Ensure compatibility with Pi
+from PIL import Image, ImageDraw
+from luma.lcd.device import ili9341
+from luma.core.interface.serial import spi
+import time
+import socket
+import threading
+import math
 
-# === Environment Setup ===
-os.environ['SDL_VIDEO_WINDOW_POS'] = '0,0'
-os.environ['QT_QPA_PLATFORM'] = 'xcb'
+# ==============================
+# 🌐 UDP LISTENER (Neural Link)
+# ==============================
+receiver_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+receiver_sock.bind(("127.0.0.1", 5005))
+receiver_sock.setblocking(False)
 
-# === Settings ===
-samplerate = 16000
-blocksize = 1024
-input_device = 4     # PulseAudio input: UGREEN mic
-output_device = 8    # PulseAudio output: default sink (UGREEN headphone jack)
-display_samples = 90
-taper_size = 10
+current_amp = 0.0
 
-# === Butterworth Filter ===
-def butter_lowpass(cutoff=1000, fs=16000, order=4):
-    nyq = 0.5 * fs
-    normal_cutoff = cutoff / nyq
-    return butter(order, normal_cutoff, btype='low', analog=False)
+def socket_listener():
+    global current_amp
+    while True:
+        try:
+            data, _ = receiver_sock.recvfrom(1024)
+            current_amp = float(data.decode())
+        except:
+            current_amp *= 0.85 
+            time.sleep(0.01)
 
-b, a = butter_lowpass()
+threading.Thread(target=socket_listener, daemon=True).start()
 
-def smooth_signal(data):
-    return lfilter(b, a, data)
+# ==============================
+# Display Setup (LOCKED)
+# ==============================
+WIDTH, HEIGHT = 320, 240
+serial = spi(port=0, device=0, gpio_DC=24, gpio_RST=25)
+device = ili9341(serial, width=WIDTH, height=HEIGHT, rotate=1)
 
-# === Visualization Setup ===
-fig = plt.figure(figsize=(8, 4.8), dpi=100)
-manager = plt.get_current_fig_manager()
+img = Image.new("RGB", device.size)
+draw = ImageDraw.Draw(img)
 
-# 🖥️ Enable fullscreen again
-try:
-    manager.full_screen_toggle()
-except AttributeError:
-    pass
-
-ax = fig.add_subplot(111)
-fig.patch.set_facecolor('black')
-ax.set_facecolor('black')
-ax.set_ylim(-1.0, 1.0)
-ax.set_xlim(0, display_samples)
-ax.axis('off')
-
-try:
-    manager.canvas.manager.window.config(cursor='none')
-except Exception:
-    try:
-        manager.window.config(cursor='none')
-    except:
-        pass
-
-# Trail waveform setup
-trail_length = 6
-line_history = [
-    ax.plot(np.zeros(display_samples), color='#00ffcc', linewidth=1.8, alpha=0.15 * (i + 1))[0]
-    for i in range(trail_length)
-]
-main_line, = ax.plot(np.zeros(display_samples), color='#00ffcc', linewidth=2.5, alpha=1.0)
-waveform = np.zeros(blocksize)
-
-# === Audio Callback ===
-def audio_callback(indata, outdata, frames, time, status):
-    global waveform
-    if status:
-        print(status)
-    mono = indata[:, 0]
-    waveform = smooth_signal(mono)
-    outdata[:] = np.tile(mono[:, np.newaxis], (1, outdata.shape[1]))  # Duplicate mono input to all output channels
-
-# === Update Function for Animation ===
-waveform_history = [np.zeros(display_samples) for _ in range(trail_length)]
+# ==============================
+# Waveform Settings
+# ==============================
+DISPLAY_SAMPLES = WIDTH
+TRAIL_LENGTH = 6
+TAPER_SIZE = 40 # Increased slightly for smoother edge fade
+phase = 0.0
 
 def apply_edge_taper(data, size):
     window = np.ones_like(data)
@@ -83,36 +53,50 @@ def apply_edge_taper(data, size):
     window[-size:] *= fade[::-1]
     return data * window
 
-def update(frame):
-    mid = blocksize // 2
-    half_disp = display_samples // 2
-    partial_wave = waveform[mid - half_disp : mid + half_disp].copy()
-    partial_wave = apply_edge_taper(partial_wave, taper_size)
+waveform_history = [np.zeros(DISPLAY_SAMPLES) for _ in range(TRAIL_LENGTH)]
+
+# ==============================
+# Draw Wave (UDP Synced)
+# ==============================
+def draw_wave():
+    global phase
+    draw.rectangle((0, 0, WIDTH, HEIGHT), fill="black")
+    mid_y = HEIGHT // 2
+
+    # Create the holographic sine pattern
+    x_vals = np.linspace(0, 4 * np.pi, WIDTH)
+    
+    # We use current_amp from the UDP link to drive the height
+    raw_wave = np.sin(x_vals + phase) * current_amp
+    wave = apply_edge_taper(raw_wave, TAPER_SIZE)
+    
     waveform_history.pop(0)
-    waveform_history.append(partial_wave)
+    waveform_history.append(wave)
 
-    for i, line in enumerate(line_history):
-        line.set_ydata(waveform_history[i])
-    main_line.set_ydata(waveform_history[-1])
-    return line_history + [main_line]
+    for i, w in enumerate(waveform_history):
+        alpha = int(255 * ((i + 1) / TRAIL_LENGTH) * 0.8)
+        color = (0, alpha, alpha) 
 
-# === Ctrl+Q to Exit ===
-def on_key(event):
-    if event.key == 'ctrl+q':
-        plt.close(fig)
+        # SCALE FIX: Changed 15.0 to 0.8 to prevent clipping top/bottom
+        # This keeps the wave contained within the 240px height.
+        points = [(x, mid_y - int(y * (HEIGHT / 2) * 1.0)) for x, y in enumerate(w)]
 
-fig.canvas.mpl_connect('key_press_event', on_key)
+        if len(points) > 1:
+            draw.line(points, fill=color, width=2 if i == TRAIL_LENGTH-1 else 1)
 
-# === Start Audio Stream and Animation ===
-stream = sd.Stream(
-    samplerate=samplerate,
-    blocksize=blocksize,
-    device=(input_device, output_device),
-    dtype='float32',
-    channels=1,
-    callback=audio_callback
-)
+    device.display(img)
+    phase += 0.4
 
-with stream:
-    ani = animation.FuncAnimation(fig, update, interval=32, blit=True, cache_frame_data=False)
-    plt.show()
+# ==============================
+# Main Loop
+# ==============================
+try:
+    print(">>> Auditory Hologlyph Projector ACTIVE")
+    print(">>> Listening for Brain Link (UDP 5005)...")
+    
+    while True:
+        draw_wave()
+        time.sleep(0.02)
+
+except KeyboardInterrupt:
+    print("\nProjector Offline.")
